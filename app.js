@@ -2,6 +2,8 @@
 const $ = id => document.getElementById(id);
 const LIMIT = 256 * 1024 * 1024;
 const fmt = n => n >= 1048576 ? (n / 1048576).toFixed(1) + ' Mio' : (n / 1024).toFixed(1) + ' Kio';
+let selectedFiles = [];
+const previewUrls = [];
 let hostRole = false;
 let peer, channel, connection, ownCode = '', inviteToken = '', paired = false;
 let sending = false, receiving = null, waiter = null, pending = null, chain = Promise.resolve(), opening = false, expireTimer, pairTimer;
@@ -18,12 +20,12 @@ function readyButtons(disabled) { $('create').disabled = $('join').disabled = di
 function connected() {
   paired = true; clearTimeout(expireTimer); clearTimeout(pairTimer);
   $('pair').hidden = true; $('pairRequest').hidden = true; $('verification').hidden = true;
-  $('files').disabled = $('send').disabled = false; $('speed').textContent = 'Prêt.';
+  $('files').disabled = false; $('send').disabled = !selectedFiles.length; $('speed').textContent = 'Prêt.';
   setStatus('Appareils associés. Tu peux envoyer tes fichiers dans les deux sens.');
   peer?.disconnect();
 }
 function fail(text) {
-  setStatus(text); $('send').disabled = $('files').disabled = true;
+  setStatus(text); $('send').disabled = true;
   if (waiter) { clearTimeout(waiter.timer); waiter.reject(Error(text)); waiter = null; }
   if (receiving?.writer) receiving.writer.abort().catch(() => {});
   receiving = null; pending = null; $('receive').hidden = $('reject').hidden = true;
@@ -149,6 +151,44 @@ if (/^\d{6}$/.test(scannedCode)) {
   history.replaceState(null, '', location.pathname + location.search);
   $('join').click();
 }
+function renderSelection() {
+  previewUrls.splice(0).forEach(url => URL.revokeObjectURL(url));
+  $('selection').replaceChildren();
+  const total = selectedFiles.reduce((sum, file) => sum + file.size, 0);
+  $('selectionSummary').textContent = selectedFiles.length ? `${selectedFiles.length} fichier(s) sélectionné(s) · ${fmt(total)}` : 'Aucun fichier sélectionné.';
+  $('clearSelection').hidden = !selectedFiles.length;
+  for (const [index, file] of selectedFiles.entries()) {
+    const item = document.createElement('div'); item.className = 'selection-item';
+    if (file.type.startsWith('image/') && index < 80) {
+      const image = document.createElement('img'); const url = URL.createObjectURL(file); previewUrls.push(url);
+      image.src = url; image.alt = file.name; image.loading = 'lazy'; item.append(image);
+    } else {
+      const icon = document.createElement('div'); icon.className = 'selection-icon'; icon.textContent = file.type.startsWith('video/') ? '▶' : '▤'; item.append(icon);
+    }
+    const name = document.createElement('div'); name.className = 'filename'; name.textContent = file.name;
+    const size = document.createElement('div'); size.className = 'small'; size.textContent = fmt(file.size);
+    const remove = document.createElement('button'); remove.className = 'secondary'; remove.textContent = 'Retirer'; remove.disabled = sending;
+    remove.setAttribute('aria-label', 'Retirer ' + file.name);
+    remove.onclick = () => { if (!sending) { selectedFiles.splice(index, 1); renderSelection(); } };
+    item.append(name, size, remove); $('selection').append(item);
+  }
+  $('send').disabled = !paired || sending || !selectedFiles.length;
+  for (const id of ['pickMedia', 'pickCamera', 'pickFiles', 'clearSelection']) $(id).disabled = sending;
+}
+function addSelection(input) {
+  if (sending) return;
+  const existing = new Set(selectedFiles.map(file => JSON.stringify([file.name, file.size, file.lastModified])));
+  for (const file of input.files) {
+    const key = JSON.stringify([file.name, file.size, file.lastModified]);
+    if (!existing.has(key)) { selectedFiles.push(file); existing.add(key); }
+  }
+  input.value = ''; renderSelection();
+}
+$('pickMedia').onclick = () => $('media').click();
+$('pickCamera').onclick = () => $('camera').click();
+$('pickFiles').onclick = () => $('files').click();
+for (const id of ['media', 'camera', 'files']) $(id).onchange = () => addSelection($(id));
+$('clearSelection').onclick = () => { if (!sending) { selectedFiles = []; renderSelection(); } };
 function waitFor(type, id) {
   return new Promise((resolve, reject) => {
     waiter = { type, id, resolve, reject, timer: setTimeout(() => { waiter = null; reject(Error('Délai dépassé. Le destinataire doit accepter le fichier; recommence la connexion.')); channel.close(); }, 180000) };
@@ -207,8 +247,8 @@ async function drain() {
 $('send').onclick = () => action(async () => {
   if (!paired) throw Error('Associe les appareils d’abord.');
   if (sending || receiving || pending) throw Error('Termine le transfert en cours d’abord.');
-  const files = [...$('files').files]; if (!files.length) throw Error('Choisis un fichier.');
-  sending = true; $('send').disabled = true;
+  const files = [...selectedFiles]; if (!files.length) throw Error('Choisis un fichier.');
+  sending = true; renderSelection();
   try {
     for (const file of files) {
       const id = crypto.randomUUID(); const ready = waitFor('ready', id); control({ type: 'file', id, name: file.name, size: file.size }); setStatus('Attente de l’acceptation de ' + file.name); await ready;
@@ -220,7 +260,7 @@ $('send').onclick = () => action(async () => {
       }
       await drain(); const complete = waitFor('complete', id); control({ type: 'end', id }); setStatus('Finalisation sur l’autre appareil…'); await complete; $('progress').value = 100; setStatus(file.name + ' reçu intégralement par l’autre appareil.');
     }
-  } finally { sending = false; $('send').disabled = channel?.readyState !== 'open'; }
+  } finally { sending = false; renderSelection(); }
 });
 window.addEventListener('beforeunload', event => { if (sending || receiving) { event.preventDefault(); event.returnValue = ''; } });
-window.addEventListener('pagehide', () => { urls.forEach(url => URL.revokeObjectURL(url)); peer?.destroy(); });
+window.addEventListener('pagehide', () => { urls.concat(previewUrls).forEach(url => URL.revokeObjectURL(url)); peer?.destroy(); });
