@@ -2,90 +2,163 @@
 const $ = id => document.getElementById(id);
 const LIMIT = 256 * 1024 * 1024;
 const fmt = n => n >= 1048576 ? (n / 1048576).toFixed(1) + ' Mio' : (n / 1024).toFixed(1) + ' Kio';
-let pairing = false;
-let pc, channel, sending = false, receiving = null, waiter = null, pending = null, chain = Promise.resolve();
+let hostRole = false;
+let peer, channel, connection, ownCode = '', inviteToken = '', paired = false;
+let sending = false, receiving = null, waiter = null, pending = null, chain = Promise.resolve(), opening = false, expireTimer, pairTimer;
 const urls = [];
 const setStatus = message => { $('status').textContent = message; };
 const control = message => channel.send(JSON.stringify(message));
-function encode(description) { return btoa(JSON.stringify(description)); }
-function decode(text) {
-  if (text.length > 100000) throw Error('Code trop long.');
-  const data = JSON.parse(atob(text.trim()));
-  if (!['offer', 'answer'].includes(data.type) || typeof data.sdp !== 'string') throw Error('Code invalide.');
-  return data;
+const options = { secure: true, debug: 0, config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] } };
+function digits(length) {
+  let value; const range = 10 ** length; const ceiling = Math.floor(4294967296 / range) * range;
+  do { value = crypto.getRandomValues(new Uint32Array(1))[0]; } while (value >= ceiling);
+  return String(value % range).padStart(length, '0');
 }
-function setup() {
-  if (pc) return;
-  if (typeof RTCPeerConnection !== 'function') throw Error('WebRTC est indisponible dans ce navigateur. Ouvre cette page dans Chrome, Edge, Firefox ou Safari.');
-  pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
-  pc.ondatachannel = event => attach(event.channel);
-  pc.onconnectionstatechange = () => {
-    if (pc.connectionState === 'failed') fail('Connexion impossible. Essaie le même Wi-Fi, puis recommence l’association.');
-    if (pc.connectionState === 'disconnected') setStatus('Connexion interrompue. Attente de reconnexion…');
-  };
-}
-function attach(dc) {
-  if (channel) { dc.close(); return; }
-  channel = dc; channel.binaryType = 'arraybuffer';
-  dc.onopen = () => { setStatus('Appareils connectés. Tu peux envoyer des fichiers.'); $('files').disabled = false; $('send').disabled = false; $('speed').textContent = 'Prêt.'; $('pair').hidden = true; };
-  dc.onclose = () => { if (channel === dc) fail('Connexion fermée. Recharge les deux pages pour recommencer.'); };
-  dc.onerror = () => fail('Erreur de transfert. Recharge les deux pages.');
-  dc.onmessage = event => { chain = chain.then(() => message(event.data)).catch(error => { fail(error.message); dc.close(); }); };
+function readyButtons(disabled) { $('create').disabled = $('join').disabled = disabled; }
+function connected() {
+  paired = true; clearTimeout(expireTimer); clearTimeout(pairTimer);
+  $('pair').hidden = true; $('pairRequest').hidden = true; $('verification').hidden = true;
+  $('files').disabled = $('send').disabled = false; $('speed').textContent = 'Prêt.';
+  setStatus('Appareils associés. Tu peux envoyer tes fichiers dans les deux sens.');
+  peer?.disconnect();
 }
 function fail(text) {
-  setStatus(text); $('send').disabled = true; $('files').disabled = true;
+  setStatus(text); $('send').disabled = $('files').disabled = true;
   if (waiter) { clearTimeout(waiter.timer); waiter.reject(Error(text)); waiter = null; }
-  if (receiving) { if (receiving.writer) receiving.writer.abort().catch(() => {}); receiving = null; }
-  pending = null; $('receive').hidden = $('reject').hidden = true;
+  if (receiving?.writer) receiving.writer.abort().catch(() => {});
+  receiving = null; pending = null; $('receive').hidden = $('reject').hidden = true;
 }
-async function gathered() {
-  const connection = pc;
-  if (connection.iceGatheringState !== 'complete') await new Promise((resolve, reject) => {
-    let timer;
-    function finish(error) {
-      clearTimeout(timer);
-      connection.removeEventListener('icegatheringstatechange', check);
-      if (error) reject(error); else resolve();
-    }
-    function check() { if (connection.iceGatheringState === 'complete') finish(); }
-    timer = setTimeout(() => {
-      if (/^a=candidate:/m.test(connection.localDescription?.sdp || '')) finish();
-      else finish(Error('Aucune adresse de connexion disponible. Vérifie les autorisations WebRTC ou essaie un autre navigateur, puis recommence.'));
-    }, 8000);
-    connection.addEventListener('icegatheringstatechange', check); check();
-  });
-  if (!/^a=candidate:/m.test(connection.localDescription?.sdp || '')) throw Error('Le navigateur ne fournit aucune adresse WebRTC. Essaie un autre navigateur ou réseau.');
-  $('outgoing').value = encode(connection.localDescription);
-}
-async function pairAction(fn) {
-  if (pairing) return;
-  pairing = true; $('create').disabled = $('accept').disabled = true;
-  setStatus('Création du code en cours… Recherche réseau (jusqu’à 8 secondes).');
-  try { await fn(); }
-  catch (error) {
-    const previous = pc; channel = null; pc = null; previous?.close();
-    $('outgoing').value = '';
-    setStatus(error.message + ' Tu peux réessayer.');
-  } finally { pairing = false; $('create').disabled = $('accept').disabled = false; }
+function cleanup() {
+  clearTimeout(expireTimer); clearTimeout(pairTimer); paired = false; channel = null; connection = null;
+  peer?.destroy(); peer = null; chain = Promise.resolve();
+  $('pairRequest').hidden = true; $('verification').hidden = true;
 }
 async function action(fn) { try { await fn(); } catch (error) { setStatus(error.message); } }
-$('create').onclick = () => pairAction(async () => { if (pc) throw Error('Clique sur Recommencer pour créer une nouvelle invitation.'); setup(); attach(pc.createDataChannel('files', { ordered: true })); await pc.setLocalDescription(await pc.createOffer()); await gathered(); setStatus('Invitation prête. Transmets le code à l’autre appareil.'); });
-$('accept').onclick = () => pairAction(async () => {
-  const description = decode($('incoming').value);
-  if (description.type === 'offer') {
-    if (pc) throw Error('Cette page a déjà une connexion. Clique sur Recommencer pour accepter une invitation.');
-    setup(); await pc.setRemoteDescription(description); await pc.setLocalDescription(await pc.createAnswer()); await gathered(); setStatus('Réponse prête. Renvoie ton code au premier appareil.');
-  } else { if (!pc || pc.signalingState !== 'have-local-offer') throw Error('Crée d’abord une invitation sur cet appareil.'); await pc.setRemoteDescription(description); setStatus('Connexion en cours… Si elle échoue, essaie le même Wi-Fi.'); }
-  $('incoming').value = '';
+function createPeer(id) {
+  return new Promise((resolve, reject) => {
+    if (typeof Peer !== 'function') return reject(Error('Le module de connexion ne se charge pas. Recharge la page.'));
+    if (typeof RTCPeerConnection !== 'function') return reject(Error('WebRTC est indisponible. Essaie Chrome, Edge, Firefox ou Safari.'));
+    const instance = id ? new Peer(id, options) : new Peer(options); peer = instance;
+    const timer = setTimeout(() => { instance.destroy(); reject(Error('Service de connexion indisponible. Vérifie Internet et réessaie.')); }, 15000);
+    instance.once('open', () => { clearTimeout(timer); resolve(instance); });
+    instance.on('error', error => {
+      clearTimeout(timer);
+      if (peer !== instance) return;
+      const errorText = error.type === 'peer-unavailable' ? 'Code introuvable ou expiré. Vérifie les six chiffres et réessaie.' : 'Connexion impossible. Vérifie Internet, essaie le même Wi-Fi ou recommence.';
+      if (!instance.open && !paired) reject(Object.assign(Error(errorText), { type: error.type }));
+      else if (!paired) { clearTimeout(pairTimer); channel = null; const old = connection; connection = null; old?.close(); readyButtons(false); opening = false; setStatus(errorText); }
+    });
+    instance.on('connection', incoming => {
+      if (instance !== peer || connection || paired || !ownCode) { incoming.close(); return; }
+      if (!/^\d{4}$/.test(incoming.metadata?.verification || '')) { incoming.close(); return; }
+      bind(incoming, true);
+    });
+    instance.on('disconnected', () => { if (!paired && peer === instance) setStatus('Service de connexion déconnecté. Crée un nouveau code.'); });
+  });
+}
+function bind(dc, host) {
+  hostRole = host;
+  connection = dc;
+  pairTimer = setTimeout(() => {
+    if (connection !== dc || paired) return;
+    connection = null; channel = null; dc.close(); opening = false; readyButtons(false);
+    $('pairRequest').hidden = true;
+    setStatus('Association trop longue. Essaie le même Wi-Fi puis recommence.');
+  }, 60000);
+  dc.on('open', () => {
+    if (connection !== dc) return;
+    channel = dc.dataChannel;
+    if (host) {
+      $('pairRequest').hidden = false;
+      $('verifyCode').textContent = dc.metadata.verification;
+      setStatus('Un appareil veut se connecter. Compare le code de vérification affiché sur les deux appareils.');
+    } else setStatus('Connexion établie. Confirme l’association sur le premier appareil.');
+  });
+  dc.on('data', data => {
+    if (connection !== dc) return;
+    chain = chain.then(() => message(data)).catch(error => { fail(error.message); dc.close(); });
+  });
+  dc.on('close', () => {
+    if (connection !== dc) return;
+    clearTimeout(pairTimer); connection = null; channel = null; paired = false;
+    fail('Connexion fermée. Clique sur Recommencer pour associer les appareils.');
+    $('pair').hidden = false; $('pairRequest').hidden = true; readyButtons(false); opening = false;
+  });
+  dc.on('error', () => { fail('Erreur de connexion. Recommence l’association.'); dc.close(); });
+}
+$('create').onclick = () => action(async () => {
+  if (opening) return;
+  opening = true; readyButtons(true); cleanup(); ownCode = '';
+  $('invitation').hidden = true; setStatus('Création de ton code à six chiffres…');
+  try {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const code = digits(6);
+      try { await createPeer('flash-transfert-v3-' + code); ownCode = code; break; }
+      catch (error) { cleanup(); if (error.type !== 'unavailable-id' || attempt === 4) throw error; }
+    }
+    inviteToken = crypto.randomUUID();
+    const link = new URL(location.href); link.hash = new URLSearchParams({ code: ownCode, token: inviteToken }).toString();
+    $('code').textContent = ownCode.slice(0, 3) + ' ' + ownCode.slice(3);
+    $('shareLink').value = link.href; $('invitation').hidden = false;
+    try {
+      const qr = qrcode(0, 'M'); qr.addData(link.href); qr.make();
+      const count = qr.getModuleCount(), scale = 5, margin = 4, canvas = $('qr');
+      canvas.width = canvas.height = (count + margin * 2) * scale;
+      const ctx = canvas.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height); ctx.fillStyle = '#0c111b';
+      for (let y = 0; y < count; y++) for (let x = 0; x < count; x++) if (qr.isDark(y, x)) ctx.fillRect((x + margin) * scale, (y + margin) * scale, scale, scale);
+      canvas.hidden = false;
+    } catch { $('qr').hidden = true; }
+    setStatus('Code prêt. Scanne le QR avec la caméra de ton cell ou saisis les six chiffres sur l’autre appareil.');
+    expireTimer = setTimeout(() => {
+      if (paired) return; cleanup(); ownCode = ''; $('invitation').hidden = true; setStatus('Code expiré après 10 minutes. Crée un nouveau code.'); readyButtons(false);
+    }, 600000);
+  } finally { opening = false; readyButtons(false); }
 });
-$('copy').onclick = () => action(async () => { if (!$('outgoing').value) throw Error('Crée ou accepte une invitation d’abord.'); await navigator.clipboard.writeText($('outgoing').value); setStatus('Code copié. Transmets-le uniquement à ton autre appareil.'); });
-$('reset').onclick = () => location.reload();
+$('join').onclick = () => action(async () => {
+  if (opening) return;
+  const code = $('joinCode').value.replace(/\s/g, '');
+  if (!/^\d{6}$/.test(code)) throw Error('Saisis exactement six chiffres.');
+  if (ownCode === code) throw Error('Saisis ce code sur ton autre appareil.');
+  opening = true; readyButtons(true); cleanup(); ownCode = ''; $('invitation').hidden = true;
+  setStatus('Recherche de l’autre appareil…');
+  try {
+    await createPeer();
+    const verification = digits(4);
+    $('verification').hidden = false; $('myVerifyCode').textContent = verification;
+    const dc = peer.connect('flash-transfert-v3-' + code, { serialization: 'raw', reliable: true, metadata: { verification, token: scannedCode === code ? scannedToken : '' } });
+    bind(dc, false);
+  } catch (error) { cleanup(); throw error; }
+  finally { opening = false; readyButtons(false); }
+});
+$('approvePair').onclick = () => action(async () => {
+  if (!channel || !connection) return;
+  control({ type: 'paired' }); connected();
+});
+$('denyPair').onclick = () => {
+  const old = connection; connection = null; channel = null; clearTimeout(pairTimer); old?.close();
+  $('pairRequest').hidden = true; setStatus('Association refusée. Tu peux attendre ton autre appareil.');
+};
+$('copy').onclick = () => action(async () => { if (!ownCode) return; await navigator.clipboard.writeText(ownCode); setStatus('Code copié : ' + ownCode); });
+$('copyLink').onclick = () => action(async () => { await navigator.clipboard.writeText($('shareLink').value); setStatus('Lien copié. Ouvre-le sur ton autre appareil.'); });
+$('reset').onclick = () => location.assign(location.pathname);
+$('joinCode').addEventListener('keydown', event => { if (event.key === 'Enter') $('join').click(); });
+const scanned = new URLSearchParams(location.hash.slice(1));
+const scannedCode = scanned.get('code') || '', scannedToken = scanned.get('token') || '';
+if (/^\d{6}$/.test(scannedCode)) {
+  $('joinCode').value = scannedCode;
+  history.replaceState(null, '', location.pathname + location.search);
+  $('join').click();
+}
 function waitFor(type, id) {
   return new Promise((resolve, reject) => {
     waiter = { type, id, resolve, reject, timer: setTimeout(() => { waiter = null; reject(Error('Délai dépassé. Le destinataire doit accepter le fichier; recommence la connexion.')); channel.close(); }, 180000) };
   });
 }
 async function message(data) {
+  if (!paired) {
+    if (!hostRole && typeof data === 'string' && JSON.parse(data).type === 'paired') { connected(); return; }
+    throw Error('Association non confirmée.');
+  }
   if (typeof data !== 'string') {
     if (!receiving) throw Error('Données reçues sans fichier accepté.');
     if (receiving.bytes + data.byteLength > receiving.size) throw Error('Taille reçue invalide.');
@@ -132,6 +205,7 @@ async function drain() {
   if (channel.readyState !== 'open') throw Error('Connexion fermée.');
 }
 $('send').onclick = () => action(async () => {
+  if (!paired) throw Error('Associe les appareils d’abord.');
   if (sending || receiving || pending) throw Error('Termine le transfert en cours d’abord.');
   const files = [...$('files').files]; if (!files.length) throw Error('Choisis un fichier.');
   sending = true; $('send').disabled = true;
@@ -149,4 +223,4 @@ $('send').onclick = () => action(async () => {
   } finally { sending = false; $('send').disabled = channel?.readyState !== 'open'; }
 });
 window.addEventListener('beforeunload', event => { if (sending || receiving) { event.preventDefault(); event.returnValue = ''; } });
-window.addEventListener('pagehide', () => { urls.forEach(url => URL.revokeObjectURL(url)); pc?.close(); });
+window.addEventListener('pagehide', () => { urls.forEach(url => URL.revokeObjectURL(url)); peer?.destroy(); });

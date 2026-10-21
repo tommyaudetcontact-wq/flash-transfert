@@ -1,40 +1,28 @@
 # Flash Transfert
 
-Application de transfert de fichiers entre téléphone et ordinateur, compatible GitHub Pages.
+Transfert direct de fichiers entre téléphone et ordinateur, compatible GitHub Pages.
 
-## Version GitHub Pages
+## Utilisation
 
-Les fichiers `index.html` et `app.js` constituent l’application complète. Aucun serveur Python, compte utilisateur ou stockage cloud n’est nécessaire pour cette version.
+1. Ouvrir le site sur les deux appareils.
+2. Sur le premier appareil, cliquer sur **Créer un code à 6 chiffres**.
+3. Scanner le QR avec la caméra du téléphone, ou saisir les six chiffres sur l’autre appareil et cliquer sur **Se connecter**.
+4. Comparer le code de vérification affiché sur les deux écrans et confirmer **C’est mon appareil** sur le premier.
+5. Choisir les fichiers et les envoyer. Le destinataire accepte chaque fichier.
 
-### Publier
+Un code est valable dix minutes et permet une seule association. Les deux pages et appareils doivent rester ouverts et éveillés. Les fichiers reçus en mémoire doivent être enregistrés via leur lien de téléchargement.
 
-1. Pousser ce dépôt sur GitHub.
-2. Ouvrir **Settings → Pages** dans le dépôt.
-3. Choisir **Deploy from a branch**, puis la branche **main** et le dossier **/ (root)**.
-4. Enregistrer et ouvrir l’URL donnée par GitHub Pages sur les deux appareils.
+## Hébergement
 
-### Associer et transférer
+Dans Settings → Pages, choisir Deploy from a branch → main → / (root).
+Aucun serveur Python ni compilation n’est nécessaire.
 
-1. Sur le premier appareil, cliquer sur **Créer une invitation** et copier le code.
-2. Transmettre ce code à l’autre appareil par un moyen privé.
-3. Sur le deuxième appareil, coller l’invitation et cliquer sur **Utiliser le code reçu**.
-4. Copier la réponse générée et la transmettre au premier appareil.
-5. Sur le premier appareil, coller la réponse et cliquer sur **Utiliser le code reçu**.
-6. Attendre la connexion, choisir des fichiers et cliquer sur **Envoyer la sélection**.
-7. Accepter chaque fichier sur le destinataire. Si un lien **Enregistrer** apparaît, le toucher pour conserver le fichier.
+## Architecture et confidentialité
 
-Les codes contiennent les informations de connexion : les transmettre uniquement à l’autre appareil. Garder les deux onglets ouverts et les appareils éveillés.
+GitHub Pages sert l’interface. PeerJS Cloud assure la mise en relation via HTTPS/WebSocket et traite les métadonnées de connexion. Le STUN de Google aide à découvrir les adresses réseau. Les fichiers passent directement sur un canal WebRTC chiffré. Le QR est généré localement, sans envoyer son contenu à un générateur externe.
 
-### Réseau, confidentialité et limites
+Les bibliothèques PeerJS 1.5.5 et QR Code Generator 2.0.4 sont incluses dans le dépôt, avec leurs licences dans THIRD-PARTY-LICENSES.txt. La disponibilité de la connexion dépend de PeerJS Cloud. Aucun relais TURN n’est configuré : certains réseaux distants bloquent la connexion. Essayer le même Wi-Fi.
 
-Les fichiers passent par un canal WebRTC chiffré entre navigateurs. GitHub sert seulement l’interface. Le serveur STUN `stun.l.google.com:19302` aide à découvrir les adresses réseau; il ne stocke pas les fichiers. Les codes d’association peuvent contenir des informations d’adresse réseau.
+Le code à six chiffres n’est pas un mot de passe fort : le garder privé, comparer les codes de vérification et accepter uniquement son appareil. Le service public de signalisation n’est pas assorti d’un contrôle de tentatives propre à cette application.
 
-La connexion directe peut fonctionner sur le même réseau ou entre réseaux distants. Certains NAT, pare-feu et Wi-Fi invités la bloquent : aucun relais TURN n’est configuré. Le fonctionnement sur tous les réseaux distants n’est donc pas garanti. Essayer le même Wi-Fi si l’association échoue.
-
-Sur les navigateurs proposant `showSaveFilePicker` (notamment Chrome/Edge sur ordinateur), les fichiers reçus sont écrits directement sur disque après acceptation. Sinon, chaque fichier est conservé temporairement en mémoire puis proposé au téléchargement, avec une limite de 256 Mio par fichier. Plusieurs fichiers reçus peuvent consommer beaucoup de mémoire : enregistrer les fichiers et recharger les pages entre grosses séries. Les gros transferts sur téléphone dépendent aussi des limites mémoire et de la mise en veille du système.
-
-Pas de reprise après interruption. Aucun débit maximal garanti : réseau, stockage et appareils déterminent la vitesse.
-
-## Vérification
-
-La version Python a été testée par envoi et téléchargement avec comparaison des octets. Pour la version Pages, consulter les vérifications rapportées avec la livraison. Les tests simulés ne remplacent pas un transfert réel entre téléphone et PC.
+Sur Chrome/Edge compatibles sur PC, réception directement sur disque. Sinon, réception en mémoire limitée à 256 Mio par fichier. Plusieurs fichiers peuvent consommer beaucoup de mémoire. Pas de reprise après interruption. Aucun débit maximal garanti.
