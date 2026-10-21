@@ -2,9 +2,10 @@
 const $ = id => document.getElementById(id);
 const LIMIT = 256 * 1024 * 1024;
 const fmt = n => n >= 1048576 ? (n / 1048576).toFixed(1) + ' Mio' : (n / 1024).toFixed(1) + ' Kio';
+let pairing = false;
 let pc, channel, sending = false, receiving = null, waiter = null, pending = null, chain = Promise.resolve();
 const urls = [];
-const status = message => { $('status').textContent = message; };
+const setStatus = message => { $('status').textContent = message; };
 const control = message => channel.send(JSON.stringify(message));
 function encode(description) { return btoa(JSON.stringify(description)); }
 function decode(text) {
@@ -15,46 +16,69 @@ function decode(text) {
 }
 function setup() {
   if (pc) return;
+  if (typeof RTCPeerConnection !== 'function') throw Error('WebRTC est indisponible dans ce navigateur. Ouvre cette page dans Chrome, Edge, Firefox ou Safari.');
   pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
   pc.ondatachannel = event => attach(event.channel);
   pc.onconnectionstatechange = () => {
     if (pc.connectionState === 'failed') fail('Connexion impossible. Essaie le même Wi-Fi, puis recommence l’association.');
-    if (pc.connectionState === 'disconnected') status('Connexion interrompue. Attente de reconnexion…');
+    if (pc.connectionState === 'disconnected') setStatus('Connexion interrompue. Attente de reconnexion…');
   };
 }
 function attach(dc) {
   if (channel) { dc.close(); return; }
   channel = dc; channel.binaryType = 'arraybuffer';
-  dc.onopen = () => { status('Appareils connectés. Tu peux envoyer des fichiers.'); $('files').disabled = false; $('send').disabled = false; $('speed').textContent = 'Prêt.'; $('pair').hidden = true; };
-  dc.onclose = () => fail('Connexion fermée. Recharge les deux pages pour recommencer.');
+  dc.onopen = () => { setStatus('Appareils connectés. Tu peux envoyer des fichiers.'); $('files').disabled = false; $('send').disabled = false; $('speed').textContent = 'Prêt.'; $('pair').hidden = true; };
+  dc.onclose = () => { if (channel === dc) fail('Connexion fermée. Recharge les deux pages pour recommencer.'); };
   dc.onerror = () => fail('Erreur de transfert. Recharge les deux pages.');
   dc.onmessage = event => { chain = chain.then(() => message(event.data)).catch(error => { fail(error.message); dc.close(); }); };
 }
 function fail(text) {
-  status(text); $('send').disabled = true; $('files').disabled = true;
+  setStatus(text); $('send').disabled = true; $('files').disabled = true;
   if (waiter) { clearTimeout(waiter.timer); waiter.reject(Error(text)); waiter = null; }
   if (receiving) { if (receiving.writer) receiving.writer.abort().catch(() => {}); receiving = null; }
   pending = null; $('receive').hidden = $('reject').hidden = true;
 }
 async function gathered() {
-  if (pc.iceGatheringState !== 'complete') await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { pc.removeEventListener('icegatheringstatechange', check); reject(Error('Recherche réseau trop longue. Recommence.')); }, 20000);
-    function check() { if (pc.iceGatheringState === 'complete') { clearTimeout(timer); pc.removeEventListener('icegatheringstatechange', check); resolve(); } }
-    pc.addEventListener('icegatheringstatechange', check); check();
+  const connection = pc;
+  if (connection.iceGatheringState !== 'complete') await new Promise((resolve, reject) => {
+    let timer;
+    function finish(error) {
+      clearTimeout(timer);
+      connection.removeEventListener('icegatheringstatechange', check);
+      if (error) reject(error); else resolve();
+    }
+    function check() { if (connection.iceGatheringState === 'complete') finish(); }
+    timer = setTimeout(() => {
+      if (/^a=candidate:/m.test(connection.localDescription?.sdp || '')) finish();
+      else finish(Error('Aucune adresse de connexion disponible. Vérifie les autorisations WebRTC ou essaie un autre navigateur, puis recommence.'));
+    }, 8000);
+    connection.addEventListener('icegatheringstatechange', check); check();
   });
-  $('outgoing').value = encode(pc.localDescription);
+  if (!/^a=candidate:/m.test(connection.localDescription?.sdp || '')) throw Error('Le navigateur ne fournit aucune adresse WebRTC. Essaie un autre navigateur ou réseau.');
+  $('outgoing').value = encode(connection.localDescription);
 }
-async function action(fn) { try { await fn(); } catch (error) { status(error.message); } }
-$('create').onclick = () => action(async () => { if (pc) throw Error('Clique sur Recommencer pour créer une nouvelle invitation.'); setup(); attach(pc.createDataChannel('files', { ordered: true })); await pc.setLocalDescription(await pc.createOffer()); await gathered(); status('Invitation prête. Transmets le code à l’autre appareil.'); });
-$('accept').onclick = () => action(async () => {
+async function pairAction(fn) {
+  if (pairing) return;
+  pairing = true; $('create').disabled = $('accept').disabled = true;
+  setStatus('Création du code en cours… Recherche réseau (jusqu’à 8 secondes).');
+  try { await fn(); }
+  catch (error) {
+    const previous = pc; channel = null; pc = null; previous?.close();
+    $('outgoing').value = '';
+    setStatus(error.message + ' Tu peux réessayer.');
+  } finally { pairing = false; $('create').disabled = $('accept').disabled = false; }
+}
+async function action(fn) { try { await fn(); } catch (error) { setStatus(error.message); } }
+$('create').onclick = () => pairAction(async () => { if (pc) throw Error('Clique sur Recommencer pour créer une nouvelle invitation.'); setup(); attach(pc.createDataChannel('files', { ordered: true })); await pc.setLocalDescription(await pc.createOffer()); await gathered(); setStatus('Invitation prête. Transmets le code à l’autre appareil.'); });
+$('accept').onclick = () => pairAction(async () => {
   const description = decode($('incoming').value);
   if (description.type === 'offer') {
     if (pc) throw Error('Cette page a déjà une connexion. Clique sur Recommencer pour accepter une invitation.');
-    setup(); await pc.setRemoteDescription(description); await pc.setLocalDescription(await pc.createAnswer()); await gathered(); status('Réponse prête. Renvoie ton code au premier appareil.');
-  } else { if (!pc || pc.signalingState !== 'have-local-offer') throw Error('Crée d’abord une invitation sur cet appareil.'); await pc.setRemoteDescription(description); status('Connexion en cours… Si elle échoue, essaie le même Wi-Fi.'); }
+    setup(); await pc.setRemoteDescription(description); await pc.setLocalDescription(await pc.createAnswer()); await gathered(); setStatus('Réponse prête. Renvoie ton code au premier appareil.');
+  } else { if (!pc || pc.signalingState !== 'have-local-offer') throw Error('Crée d’abord une invitation sur cet appareil.'); await pc.setRemoteDescription(description); setStatus('Connexion en cours… Si elle échoue, essaie le même Wi-Fi.'); }
   $('incoming').value = '';
 });
-$('copy').onclick = () => action(async () => { if (!$('outgoing').value) throw Error('Crée ou accepte une invitation d’abord.'); await navigator.clipboard.writeText($('outgoing').value); status('Code copié. Transmets-le uniquement à ton autre appareil.'); });
+$('copy').onclick = () => action(async () => { if (!$('outgoing').value) throw Error('Crée ou accepte une invitation d’abord.'); await navigator.clipboard.writeText($('outgoing').value); setStatus('Code copié. Transmets-le uniquement à ton autre appareil.'); });
 $('reset').onclick = () => location.reload();
 function waitFor(type, id) {
   return new Promise((resolve, reject) => {
@@ -113,14 +137,14 @@ $('send').onclick = () => action(async () => {
   sending = true; $('send').disabled = true;
   try {
     for (const file of files) {
-      const id = crypto.randomUUID(); const ready = waitFor('ready', id); control({ type: 'file', id, name: file.name, size: file.size }); status('Attente de l’acceptation de ' + file.name); await ready;
+      const id = crypto.randomUUID(); const ready = waitFor('ready', id); control({ type: 'file', id, name: file.name, size: file.size }); setStatus('Attente de l’acceptation de ' + file.name); await ready;
       const start = performance.now(); $('progress').value = 0;
       for (let offset = 0; offset < file.size; offset += 16384) {
         await drain(); const chunk = await file.slice(offset, offset + 16384).arrayBuffer(); channel.send(chunk);
         const sent = Math.min(file.size, offset + chunk.byteLength); $('progress').value = file.size ? sent / file.size * 100 : 100;
         $('speed').textContent = file.name + ' · ' + fmt(sent) + ' / ' + fmt(file.size) + ' · ' + fmt(sent / Math.max((performance.now() - start) / 1000, 0.01)) + '/s';
       }
-      await drain(); const complete = waitFor('complete', id); control({ type: 'end', id }); status('Finalisation sur l’autre appareil…'); await complete; $('progress').value = 100; status(file.name + ' reçu intégralement par l’autre appareil.');
+      await drain(); const complete = waitFor('complete', id); control({ type: 'end', id }); setStatus('Finalisation sur l’autre appareil…'); await complete; $('progress').value = 100; setStatus(file.name + ' reçu intégralement par l’autre appareil.');
     }
   } finally { sending = false; $('send').disabled = channel?.readyState !== 'open'; }
 });
