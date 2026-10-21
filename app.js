@@ -1,6 +1,8 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const LIMIT = 256 * 1024 * 1024;
+const BLOCK_SIZE = 8 * 1024 * 1024;
+const BUFFER_HIGH = 4 * 1024 * 1024;
 const fmt = n => n >= 1048576 ? (n / 1048576).toFixed(1) + ' Mio' : (n / 1024).toFixed(1) + ' Kio';
 let selectedFiles = [];
 const previewUrls = [];
@@ -28,7 +30,7 @@ function fail(text) {
   setStatus(text); $('send').disabled = true;
   if (waiter) { clearTimeout(waiter.timer); waiter.reject(Error(text)); waiter = null; }
   if (receiving?.writer) receiving.writer.abort().catch(() => {});
-  receiving = null; pending = null; $('receive').hidden = $('reject').hidden = true;
+  receiving = null; pending = null; $('receive').hidden = $('receiveDownload').hidden = $('reject').hidden = true;
 }
 function cleanup() {
   clearTimeout(expireTimer); clearTimeout(pairTimer); paired = false; channel = null; connection = null;
@@ -95,7 +97,7 @@ $('create').onclick = () => action(async () => {
   try {
     for (let attempt = 0; attempt < 5; attempt++) {
       const code = digits(6);
-      try { await createPeer('flash-transfert-v3-' + code); ownCode = code; break; }
+      try { await createPeer('flash-transfert-v5-' + code); ownCode = code; break; }
       catch (error) { cleanup(); if (error.type !== 'unavailable-id' || attempt === 4) throw error; }
     }
     inviteToken = crypto.randomUUID();
@@ -127,7 +129,7 @@ $('join').onclick = () => action(async () => {
     await createPeer();
     const verification = digits(4);
     $('verification').hidden = false; $('myVerifyCode').textContent = verification;
-    const dc = peer.connect('flash-transfert-v3-' + code, { serialization: 'raw', reliable: true, metadata: { verification, token: scannedCode === code ? scannedToken : '' } });
+    const dc = peer.connect('flash-transfert-v5-' + code, { serialization: 'raw', reliable: true, metadata: { verification, token: scannedCode === code ? scannedToken : '' } });
     bind(dc, false);
   } catch (error) { cleanup(); throw error; }
   finally { opening = false; readyButtons(false); }
@@ -202,13 +204,16 @@ async function message(data) {
   if (typeof data !== 'string') {
     if (!receiving) throw Error('Données reçues sans fichier accepté.');
     if (receiving.bytes + data.byteLength > receiving.size) throw Error('Taille reçue invalide.');
-    if (receiving.writer) await receiving.writer.write(data); else receiving.parts.push(data);
+    if (receiving.writer) receiving.writeParts.push(data); else receiving.parts.push(data);
     receiving.bytes += data.byteLength;
-    $('request').textContent = receiving.name + ' · ' + fmt(receiving.bytes) + ' / ' + fmt(receiving.size);
+    if (performance.now() - receiving.lastProgress > 100 || receiving.bytes === receiving.size) {
+      $('request').textContent = receiving.name + ' · ' + fmt(receiving.bytes) + ' / ' + fmt(receiving.size);
+      receiving.lastProgress = performance.now();
+    }
     return;
   }
   const m = JSON.parse(data);
-  if (['ready', 'reject', 'complete'].includes(m.type)) {
+  if (['ready', 'reject', 'complete', 'blockAck'].includes(m.type)) {
     if (waiter && m.id === waiter.id && (m.type === waiter.type || m.type === 'reject')) {
       const w = waiter; waiter = null; clearTimeout(w.timer); if (m.type === 'reject') w.reject(Error(m.reason || 'Fichier refusé.')); else w.resolve();
     }
@@ -216,33 +221,51 @@ async function message(data) {
     if (typeof m.name !== 'string' || m.name.length > 255 || !Number.isSafeInteger(m.size) || m.size < 0 || typeof m.id !== 'string') throw Error('Description de fichier invalide.');
     if (pending || receiving || sending) { control({ type: 'reject', id: m.id, reason: 'Autre transfert en cours.' }); return; }
     if (!window.showSaveFilePicker && m.size > LIMIT) { control({ type: 'reject', id: m.id, reason: 'Le navigateur destinataire est limité à 256 Mio par fichier. Utilise Chrome ou Edge sur PC pour recevoir un gros fichier.' }); return; }
-    pending = m; $('request').textContent = m.name + ' · ' + fmt(m.size) + ' — Accepter ce fichier ?'; $('receive').hidden = $('reject').hidden = false;
+    pending = m; $('request').textContent = m.name + ' · ' + fmt(m.size) + ' — Accepter ce fichier ?'; $('receive').hidden = $('reject').hidden = false; $('receiveDownload').hidden = !window.showSaveFilePicker || m.size > LIMIT;
+  } else if (m.type === 'block') {
+    if (!receiving || receiving.id !== m.id || receiving.bytes !== m.bytes || receiving.bytes - receiving.committed > BLOCK_SIZE) throw Error('Bloc de transfert invalide.');
+    if (receiving.writer && receiving.writeParts.length) {
+      await receiving.writer.write(new Blob(receiving.writeParts)); receiving.writeParts = [];
+    }
+    receiving.committed = receiving.bytes;
+    control({ type: 'blockAck', id: m.id });
   } else if (m.type === 'end') {
     if (!receiving || receiving.id !== m.id || receiving.bytes !== receiving.size) throw Error('Fichier incomplet.');
     const file = receiving;
-    if (file.writer) await file.writer.close();
+    if (file.writer) { if (file.writeParts.length) await file.writer.write(new Blob(file.writeParts)); await file.writer.close(); }
     const row = document.createElement('div');
     if (file.writer) row.textContent = file.name + ' — enregistré sur disque.';
     else { const url = URL.createObjectURL(new Blob(file.parts)); urls.push(url); const link = document.createElement('a'); link.href = url; link.download = file.name; link.className = 'link'; link.textContent = 'Enregistrer ' + file.name; row.append(link); }
     $('downloads').append(row); receiving = null; $('request').textContent = 'Fichier reçu intégralement.'; control({ type: 'complete', id: m.id });
   } else throw Error('Message inconnu.');
 }
-$('receive').onclick = () => action(async () => {
+async function receiveFile(useDisk) {
   if (!pending) return;
   const file = pending; $('receive').disabled = true;
   try {
     let writer = null;
-    if (window.showSaveFilePicker) { const handle = await window.showSaveFilePicker({ suggestedName: file.name.replace(/[<>:"/\\|?*]/g, '_') }); writer = await handle.createWritable(); }
-    receiving = { ...file, writer, bytes: 0, parts: [] }; pending = null; $('receive').hidden = $('reject').hidden = true; control({ type: 'ready', id: file.id });
+    if (useDisk && window.showSaveFilePicker) { const handle = await window.showSaveFilePicker({ suggestedName: file.name.replace(/[<>:"/\\|?*]/g, '_') }); writer = await handle.createWritable(); }
+    receiving = { ...file, writer, bytes: 0, parts: [], writeParts: [], committed: 0, lastProgress: 0 }; pending = null; $('receive').hidden = $('receiveDownload').hidden = $('reject').hidden = true; control({ type: 'ready', id: file.id });
   } finally { $('receive').disabled = false; }
-});
-$('reject').onclick = () => { if (pending) control({ type: 'reject', id: pending.id }); pending = null; $('receive').hidden = $('reject').hidden = true; $('request').textContent = 'Fichier refusé.'; };
+}
+$('receive').onclick = () => action(() => receiveFile(true));
+$('receiveDownload').onclick = () => action(() => receiveFile(false));
+$('reject').onclick = () => { if (pending) control({ type: 'reject', id: pending.id }); pending = null; $('receive').hidden = $('receiveDownload').hidden = $('reject').hidden = true; $('request').textContent = 'Fichier refusé.'; };
 async function drain() {
-  while (channel.bufferedAmount > 1024 * 1024) {
-    if (channel.readyState !== 'open') throw Error('Connexion interrompue.');
-    await new Promise(resolve => setTimeout(resolve, 10));
-  }
-  if (channel.readyState !== 'open') throw Error('Connexion fermée.');
+  const dc = channel;
+  if (!dc || dc.readyState !== 'open') throw Error('Connexion fermée.');
+  if (dc.bufferedAmount <= BUFFER_HIGH) return;
+  dc.bufferedAmountLowThreshold = 1024 * 1024;
+  await new Promise((resolve, reject) => {
+    let timer;
+    const clear = () => { clearTimeout(timer); dc.removeEventListener('bufferedamountlow', low); dc.removeEventListener('close', closed); dc.removeEventListener('error', closed); };
+    const low = () => { clear(); resolve(); };
+    const closed = () => { clear(); reject(Error('Connexion interrompue.')); };
+    dc.addEventListener('bufferedamountlow', low, { once: true });
+    dc.addEventListener('close', closed, { once: true }); dc.addEventListener('error', closed, { once: true });
+    timer = setTimeout(() => { clear(); reject(Error('Le réseau ne répond plus. Recommence le transfert.')); }, 30000);
+    if (dc.readyState !== 'open') closed(); else if (dc.bufferedAmount <= dc.bufferedAmountLowThreshold) low();
+  });
 }
 $('send').onclick = () => action(async () => {
   if (!paired) throw Error('Associe les appareils d’abord.');
@@ -252,13 +275,37 @@ $('send').onclick = () => action(async () => {
   try {
     for (const file of files) {
       const id = crypto.randomUUID(); const ready = waitFor('ready', id); control({ type: 'file', id, name: file.name, size: file.size }); setStatus('Attente de l’acceptation de ' + file.name); await ready;
-      const start = performance.now(); $('progress').value = 0;
-      for (let offset = 0; offset < file.size; offset += 16384) {
-        await drain(); const chunk = await file.slice(offset, offset + 16384).arrayBuffer(); channel.send(chunk);
-        const sent = Math.min(file.size, offset + chunk.byteLength); $('progress').value = file.size ? sent / file.size * 100 : 100;
-        $('speed').textContent = file.name + ' · ' + fmt(sent) + ' / ' + fmt(file.size) + ' · ' + fmt(sent / Math.max((performance.now() - start) / 1000, 0.01)) + '/s';
+      const start = performance.now(); let lastProgress = 0;
+      $('progress').value = 0;
+      const maxMessage = connection?.peerConnection?.sctp?.maxMessageSize;
+      const chunkSize = Math.min(65536, Number.isFinite(maxMessage) && maxMessage > 0 ? maxMessage : 16384);
+      for (let offset = 0; offset < file.size; offset += BLOCK_SIZE) {
+        const block = await file.slice(offset, offset + BLOCK_SIZE).arrayBuffer();
+        for (let part = 0; part < block.byteLength; part += chunkSize) {
+          if (channel?.readyState !== 'open') throw Error('Connexion interrompue.');
+          if (channel.bufferedAmount > BUFFER_HIGH) await drain();
+          const chunk = new Uint8Array(block, part, Math.min(chunkSize, block.byteLength - part));
+          channel.send(chunk);
+          const sent = offset + part + chunk.byteLength;
+          if (performance.now() - lastProgress > 100) {
+            $('progress').value = sent / file.size * 100;
+            $('speed').textContent = file.name + ' · ' + fmt(sent) + ' / ' + fmt(file.size);
+            lastProgress = performance.now();
+          }
+        }
+        const acknowledged = waitFor('blockAck', id);
+        control({ type: 'block', id, bytes: offset + block.byteLength });
+        await acknowledged;
+        const accepted = offset + block.byteLength;
+        const elapsed = Math.max((performance.now() - start) / 1000, 0.001);
+        $('progress').value = accepted / file.size * 100;
+        $('speed').textContent = file.name + ' · ' + fmt(accepted) + ' / ' + fmt(file.size) + ' · ' + fmt(accepted / elapsed) + '/s · ' + (accepted / elapsed * 8 / 1e6).toFixed(1) + ' Mbit/s';
       }
-      await drain(); const complete = waitFor('complete', id); control({ type: 'end', id }); setStatus('Finalisation sur l’autre appareil…'); await complete; $('progress').value = 100; setStatus(file.name + ' reçu intégralement par l’autre appareil.');
+      const complete = waitFor('complete', id); control({ type: 'end', id }); setStatus('Finalisation sur l’autre appareil…'); await complete;
+      const seconds = Math.max((performance.now() - start) / 1000, 0.001);
+      $('progress').value = 100;
+      $('speed').textContent = fmt(file.size) + ' transférés en ' + seconds.toFixed(2) + ' s · ' + fmt(file.size / seconds) + '/s · ' + (file.size / seconds * 8 / 1e6).toFixed(1) + ' Mbit/s';
+      setStatus(file.name + ' reçu intégralement par l’autre appareil.');
     }
   } finally { sending = false; renderSelection(); }
 });
